@@ -26,6 +26,8 @@ typedef const char * (*ngx_rtmp_control_handler_t)(ngx_http_request_t *r,
 #define NGX_RTMP_CONTROL_RECORD     0x01
 #define NGX_RTMP_CONTROL_DROP       0x02
 #define NGX_RTMP_CONTROL_REDIRECT   0x04
+#define NGX_RTMP_CONTROL_RELAY      0x08
+#define NGX_RTMP_CONTROL_EXEC       0x10
 
 
 enum {
@@ -54,6 +56,8 @@ static ngx_conf_bitmask_t           ngx_rtmp_control_masks[] = {
     { ngx_string("record"),         NGX_RTMP_CONTROL_RECORD    },
     { ngx_string("drop"),           NGX_RTMP_CONTROL_DROP      },
     { ngx_string("redirect"),       NGX_RTMP_CONTROL_REDIRECT  },
+    { ngx_string("relay"),          NGX_RTMP_CONTROL_RELAY     },
+    { ngx_string("exec"),           NGX_RTMP_CONTROL_EXEC      },
     { ngx_null_string,              0                          }
 };
 
@@ -72,8 +76,8 @@ static ngx_command_t  ngx_rtmp_control_commands[] = {
 
 
 static ngx_http_module_t  ngx_rtmp_control_module_ctx = {
-    NULL,                               /* preconfiguration */
     NULL,                               /* postconfiguration */
+    NULL,                               /* preconfiguration */
 
     NULL,                               /* create main configuration */
     NULL,                               /* init main configuration */
@@ -223,10 +227,19 @@ ngx_rtmp_control_redirect_handler(ngx_http_request_t *r, ngx_rtmp_session_t *s)
     return NGX_CONF_OK;
 }
 
+typedef enum
+{
+    NGX_RTMP_CONTROL_TRAVERSE_SESSIONS = 0,  //ctx->sessions is array of ngx_rtmp_session_t* (default)
+    NGX_RTMP_CONTROL_TRAVERSE_LIVECTXS,      //ctx->sessions is array of ngx_rtmp_live_ctx_t*
+    NGX_RTMP_CONTROL_TRAVERSE_STREAMS,       //ctx->sessions is array of ngx_rtmp_live_stream_t*
+    NGX_RTMP_CONTROL_TRAVERSE_APPS,          //ctx->sessions is array of ngx_rtmp_live_app_conf_t*
+    NGX_RTMP_CONTROL_TRAVERSE_SERVERS        //ctx->sessions is array of ngx_rtmp_core_srv_conf_t*
+} control_traverse_depth;
+
 
 static const char *
 ngx_rtmp_control_walk_session(ngx_http_request_t *r,
-    ngx_rtmp_live_ctx_t *lctx)
+    ngx_rtmp_live_ctx_t *lctx, control_traverse_depth depth)
 {
     ngx_str_t                addr, *paddr, clientid;
     ngx_rtmp_session_t      *s, **ss;
@@ -284,7 +297,10 @@ ngx_rtmp_control_walk_session(ngx_http_request_t *r,
         return "allocation error";
     }
 
-    *ss = s;
+    if (depth < NGX_RTMP_CONTROL_TRAVERSE_LIVECTXS)
+        *ss = s;
+    else
+        *ss = lctx;
 
     return NGX_CONF_OK;
 }
@@ -292,13 +308,13 @@ ngx_rtmp_control_walk_session(ngx_http_request_t *r,
 
 static const char *
 ngx_rtmp_control_walk_stream(ngx_http_request_t *r,
-    ngx_rtmp_live_stream_t *ls)
+    ngx_rtmp_live_stream_t *ls, control_traverse_depth depth)
 {
     const char           *s;
     ngx_rtmp_live_ctx_t  *lctx;
 
     for (lctx = ls->ctx; lctx; lctx = lctx->next) {
-        s = ngx_rtmp_control_walk_session(r, lctx);
+        s = ngx_rtmp_control_walk_session(r, lctx, depth);
         if (s != NGX_CONF_OK) {
             return s;
         }
@@ -310,7 +326,7 @@ ngx_rtmp_control_walk_stream(ngx_http_request_t *r,
 
 static const char *
 ngx_rtmp_control_walk_app(ngx_http_request_t *r,
-    ngx_rtmp_core_app_conf_t *cacf)
+    ngx_rtmp_core_app_conf_t *cacf, control_traverse_depth depth)
 {
     size_t                     len;
     ngx_str_t                  name;
@@ -318,16 +334,31 @@ ngx_rtmp_control_walk_app(ngx_http_request_t *r,
     ngx_uint_t                 n;
     ngx_rtmp_live_stream_t    *ls;
     ngx_rtmp_live_app_conf_t  *lacf;
+    ngx_rtmp_control_ctx_t    *ctx;
 
     lacf = cacf->app_conf[ngx_rtmp_live_module.ctx_index];
+    ctx = ngx_http_get_module_ctx(r, ngx_rtmp_control_module);
 
     if (ngx_http_arg(r, (u_char *) "name", sizeof("name") - 1, &name) != NGX_OK)
     {
         for (n = 0; n < (ngx_uint_t) lacf->nbuckets; ++n) {
             for (ls = lacf->streams[n]; ls; ls = ls->next) {
-                s = ngx_rtmp_control_walk_stream(r, ls);
-                if (s != NGX_CONF_OK) {
-                    return s;
+
+                if (depth < NGINX_RTMP_CONTROL_TRAVERSE_STREAMS)
+                {
+                    s = ngx_rtmp_control_walk_stream(r, ls, depth);
+                    if (s != NGX_CONF_OK) {
+                        return s;
+                    }
+                }
+                else
+                {
+                    ngx_rtmp_live_stream_t** arrEntry = ngx_array_push(&ctx->sessions);
+                    if (arrEntry == NULL) {
+                        return "allocation error (stream)";
+                    }
+
+                    *arrEntry = ls;
                 }
             }
         }
@@ -343,9 +374,21 @@ ngx_rtmp_control_walk_app(ngx_http_request_t *r,
             continue;
         }
 
-        s = ngx_rtmp_control_walk_stream(r, ls);
-        if (s != NGX_CONF_OK) {
-            return s;
+        if (depth < NGINX_RTMP_CONTROL_TRAVERSE_STREAMS)
+        {
+            s = ngx_rtmp_control_walk_stream(r, ls, depth);
+            if (s != NGX_CONF_OK) {
+                return s;
+            }
+        }
+        else
+        {
+            ngx_rtmp_live_stream_t** arrEntry = ngx_array_push(&ctx->sessions);
+            if (arrEntry == NULL) {
+                return "allocation error (stream)";
+            }
+
+            *arrEntry = ls;
         }
     }
 
@@ -355,17 +398,19 @@ ngx_rtmp_control_walk_app(ngx_http_request_t *r,
 
 static const char *
 ngx_rtmp_control_walk_server(ngx_http_request_t *r,
-    ngx_rtmp_core_srv_conf_t *cscf)
+    ngx_rtmp_core_srv_conf_t *cscf, control_traverse_depth depth)
 {
     ngx_str_t                   app;
     ngx_uint_t                  n;
     const char                 *s;
     ngx_rtmp_core_app_conf_t  **pcacf;
+    ngx_rtmp_control_ctx_t     *ctx;
 
     if (ngx_http_arg(r, (u_char *) "app", sizeof("app") - 1, &app) != NGX_OK) {
         app.len = 0;
     }
 
+    ctx = ngx_http_get_module_ctx(r, ngx_rtmp_control_module);
     pcacf = cscf->applications.elts;
 
     for (n = 0; n < cscf->applications.nelts; ++n, ++pcacf) {
@@ -375,9 +420,21 @@ ngx_rtmp_control_walk_server(ngx_http_request_t *r,
             continue;
         }
 
-        s = ngx_rtmp_control_walk_app(r, *pcacf);
-        if (s != NGX_CONF_OK) {
-            return s;
+        if (depth < NGINX_RTMP_CONTROL_TRAVERSE_APPLICATIONS)
+        {
+            s = ngx_rtmp_control_walk_app(r, *pcacf, depth);
+            if (s != NGX_CONF_OK) {
+                return s;
+            }
+        }
+        else
+        {
+            ngx_rtmp_core_app_conf_t** arrEntry = ngx_array_push(&ctx->sessions);
+            if (arrEntry == NULL) {
+                return "allocation error (app)";
+            }
+
+            *arrEntry = *pcacf;
         }
     }
 
@@ -386,7 +443,7 @@ ngx_rtmp_control_walk_server(ngx_http_request_t *r,
 
 
 static const char *
-ngx_rtmp_control_walk(ngx_http_request_t *r, ngx_rtmp_control_handler_t h)
+ngx_rtmp_control_walk(ngx_http_request_t *r, ngx_rtmp_control_handler_t h, control_traverse_depth depth=NGX_RTMP_CONTROL_TRAVERSE_SESSIONS)
 {
     ngx_rtmp_core_main_conf_t  *cmcf = ngx_rtmp_core_main_conf;
 
@@ -409,12 +466,24 @@ ngx_rtmp_control_walk(ngx_http_request_t *r, ngx_rtmp_control_handler_t h)
     pcscf  = cmcf->servers.elts;
     pcscf += sn;
 
-    msg = ngx_rtmp_control_walk_server(r, *pcscf);
-    if (msg != NGX_CONF_OK) {
-        return msg;
-    }
-
     ctx = ngx_http_get_module_ctx(r, ngx_rtmp_control_module);
+
+    if (depth < NGINX_RTMP_CONTROL_TRAVERSE_SERVERS)
+    {
+        msg = ngx_rtmp_control_walk_server(r, *pcscf, depth);
+        if (msg != NGX_CONF_OK) {
+            return msg;
+        }
+    }
+    else
+    {
+        ngx_rtmp_core_srv_conf_t** arrEntry = ngx_array_push(&ctx->sessions);
+        if (arrEntry == NULL) {
+            return "allocation error (server)";
+        }
+
+        *arrEntry = *pcscf;
+    }
 
     s = ctx->sessions.elts;
     for (n = 0; n < ctx->sessions.nelts; n++) {
@@ -620,6 +689,69 @@ error:
     return NGX_HTTP_INTERNAL_SERVER_ERROR;
 }
 
+static ngx_int_t
+ngx_rtmp_pull_list_handler(ngx_http_request_t *r)
+{
+    ngx_rtmp_control_loc_conf_t     *llcf;
+    ngx_rtmp_core_main_conf_t      *cmcf;
+    ngx_rtmp_core_srv_conf_t      **cscf;
+    ngx_chain_t                    *cl, *l, **ll, ***lll;
+    size_t                          n;
+    off_t                           len;
+    static u_char                   tbuf[NGX_TIME_T_LEN];
+    static u_char                   nbuf[NGX_INT_T_LEN];
+
+    slcf = ngx_http_get_module_loc_conf(r, ngx_rtmp_stat_module);
+    if (slcf->stat == 0) {
+        return NGX_DECLINED;
+    }
+
+    cmcf = ngx_rtmp_core_main_conf;
+    if (cmcf == NULL) {
+        goto error;
+    }
+
+    cl = NULL;
+    ll = &cl;
+    lll = &ll;
+
+    NGX_RTMP_STAT_L("<?xml version=\"1.0\" encoding=\"utf-8\" ?>\r\n");
+
+    NGX_RTMP_STAT_L("<rtmp>\r\n");
+    NGX_RTMP_STAT_L("<built>" __DATE__ " " __TIME__ "</built>\r\n");
+
+    NGX_RTMP_STAT_L("<naccepted>");
+    NGX_RTMP_STAT(nbuf, ngx_snprintf(nbuf, sizeof(nbuf),
+                  "%ui", ngx_rtmp_naccepted) - nbuf);
+    NGX_RTMP_STAT_L("</naccepted>\r\n");
+
+    ngx_rtmp_stat_bw(r, lll, &ngx_rtmp_bw_in, "in", NGX_RTMP_STAT_BW_BYTES);
+    ngx_rtmp_stat_bw(r, lll, &ngx_rtmp_bw_out, "out", NGX_RTMP_STAT_BW_BYTES);
+
+    cscf = cmcf->servers.elts;
+    for (n = 0; n < cmcf->servers.nelts; ++n, ++cscf) {
+        ngx_rtmp_stat_server(r, lll, *cscf);
+    }
+
+    NGX_RTMP_STAT_L("</rtmp>\r\n");
+
+    len = 0;
+    for (l = cl; l; l = l->next) {
+        len += (l->buf->last - l->buf->pos);
+    }
+    ngx_str_set(&r->headers_out.content_type, "text/xml");
+    r->headers_out.content_length_n = len;
+    r->headers_out.status = NGX_HTTP_OK;
+    ngx_http_send_header(r);
+    (*ll)->buf->last_buf = 1;
+    return ngx_http_output_filter(r, cl);
+
+error:
+    r->headers_out.status = NGX_HTTP_INTERNAL_SERVER_ERROR;
+    r->headers_out.content_length_n = 0;
+    return ngx_http_send_header(r);
+}
+
 
 static ngx_int_t
 ngx_rtmp_control_handler(ngx_http_request_t *r)
@@ -685,6 +817,8 @@ ngx_rtmp_control_handler(ngx_http_request_t *r)
     NGX_RTMP_CONTROL_SECTION(RECORD, record);
     NGX_RTMP_CONTROL_SECTION(DROP, drop);
     NGX_RTMP_CONTROL_SECTION(REDIRECT, redirect);
+    NGX_RTMP_CONTROL_SECTION(RELAY, relay);
+ //   NGX_RTMP_CONTROL_SECTION(EXEC, exec);
 
 #undef NGX_RTMP_CONTROL_SECTION
 

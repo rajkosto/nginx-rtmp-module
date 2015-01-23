@@ -690,7 +690,7 @@ error:
 }
 
 static ngx_int_t
-ngx_rtmp_pull_list_handler(ngx_http_request_t *r)
+ngx_rtmp_pull_list_handler(ngx_http_request_t* r, ngx_rtmp_live_app_conf_t* s)
 {
     ngx_rtmp_control_loc_conf_t     *llcf;
     ngx_rtmp_core_main_conf_t      *cmcf;
@@ -701,13 +701,8 @@ ngx_rtmp_pull_list_handler(ngx_http_request_t *r)
     static u_char                   tbuf[NGX_TIME_T_LEN];
     static u_char                   nbuf[NGX_INT_T_LEN];
 
-    slcf = ngx_http_get_module_loc_conf(r, ngx_rtmp_stat_module);
-    if (slcf->stat == 0) {
-        return NGX_DECLINED;
-    }
-
-    cmcf = ngx_rtmp_core_main_conf;
-    if (cmcf == NULL) {
+    ngx_rtmp_live_app_conf_t* appcf = (ngx_rtmp_live_app_conf_t*)s;
+    if (appcf == NULL) {
         goto error;
     }
 
